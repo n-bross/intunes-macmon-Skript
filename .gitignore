@@ -1,0 +1,11 @@
+# Konfiguration mit echten Zugangsdaten – niemals einchecken!
+pipeline_settings.env
+
+# Laufzeit-Ausgaben
+logs/
+failed_uploads/
+*.csv
+*.zip
+
+# Claude Code interne Dateien
+.claude/
