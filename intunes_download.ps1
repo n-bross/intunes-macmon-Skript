@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.1
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition

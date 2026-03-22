@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.1
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -118,13 +118,13 @@ function Invoke-MacmonLogin {
     )
 
     try {
-        $resp = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec -ErrorAction Stop
+        $resp = Invoke-WebRequest -UseBasicParsing -SkipCertificateCheck -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec -ErrorAction Stop
         return [PSCustomObject]@{ StatusCode = [int]$resp.StatusCode; Message = '' }
     } catch {
         $statusCode = 0
         $msg = [string]$_.Exception.Message
-        if ($_.Exception -is [System.Net.WebException] -and $_.Exception.Response) {
-            $statusCode = [int]([System.Net.HttpWebResponse]$_.Exception.Response).StatusCode
+        if ($_.Exception -is [Microsoft.PowerShell.Commands.HttpResponseException]) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
         } elseif ($msg -match '\((\d{3})\)') {
             $statusCode = [int]$Matches[1]
         }
@@ -166,29 +166,17 @@ Write-Check -Status 'OK' -Name 'Network' -Message "DNS und Port 443 erreichbar f
 
 # Check 3: TLS/HTTPS handshake
 try {
-    $req = [System.Net.HttpWebRequest]::Create($env:MACMON_BASE)
-    $req.Method = 'HEAD'
-    $req.Timeout = 10000
-    try {
-        $resp = [System.Net.HttpWebResponse]$req.GetResponse()
-        $resp.Close()
-    } catch [System.Net.WebException] {
-        $webEx = [System.Net.WebException]$_
-        if ($webEx.Response) {
-            # TLS ok, HTTP status may still be 401/403/404
-        } else {
-            if (Test-TlsMessage -Message $webEx.Message) {
-                Stop-WithCode -Code $EXIT_TLS -Name 'TLS' -Message "TLS/HTTPS Fehler: $($webEx.Message)"
-            }
-            Stop-WithCode -Code $EXIT_NETWORK -Name 'Network' -Message "HTTPS Verbindung fehlgeschlagen: $($webEx.Message)"
-        }
-    }
+    $null = Invoke-WebRequest -UseBasicParsing -SkipCertificateCheck -Method Head -Uri $env:MACMON_BASE -TimeoutSec 10 -ErrorAction Stop
 } catch {
-    $msg = [string]$_.Exception.Message
-    if (Test-TlsMessage -Message $msg) {
-        Stop-WithCode -Code $EXIT_TLS -Name 'TLS' -Message "TLS/HTTPS Fehler: $msg"
+    if ($_.Exception -is [Microsoft.PowerShell.Commands.HttpResponseException]) {
+        # TLS ok, HTTP status may still be 401/403/404
+    } else {
+        $msg = [string]$_.Exception.Message
+        if (Test-TlsMessage -Message $msg) {
+            Stop-WithCode -Code $EXIT_TLS -Name 'TLS' -Message "TLS/HTTPS Fehler: $msg"
+        }
+        Stop-WithCode -Code $EXIT_NETWORK -Name 'Network' -Message "HTTPS Verbindung fehlgeschlagen: $msg"
     }
-    Stop-WithCode -Code $EXIT_NETWORK -Name 'Network' -Message "HTTPS Verbindung fehlgeschlagen: $msg"
 }
 Write-Check -Status 'OK' -Name 'TLS' -Message 'TLS/HTTPS Handshake erfolgreich.'
 
@@ -251,48 +239,28 @@ if (-not $sampleRows -or $sampleRows.Count -eq 0) {
 }
 
 # Check 7: short stress test
-$stressScript = {
-    param($Uri, $Headers, $TimeoutSec)
+$stressUri     = $env:MACMON_BASE
+$stressHeaders = $authHeaders
+$stressTimeout = $stressTimeoutSeconds
 
+$stressResults = 1..$stressRequests | ForEach-Object -Parallel {
     try {
-        $r = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec -ErrorAction Stop
+        $r = Invoke-WebRequest -UseBasicParsing -SkipCertificateCheck -Method Get -Uri $using:stressUri -Headers $using:stressHeaders -TimeoutSec $using:stressTimeout -ErrorAction Stop
         [PSCustomObject]@{ Ok = $true; StatusCode = [int]$r.StatusCode; Message = '' }
     } catch {
         $statusCode = 0
         $msg = [string]$_.Exception.Message
-        if ($_.Exception -is [System.Net.WebException] -and $_.Exception.Response) {
-            $statusCode = [int]([System.Net.HttpWebResponse]$_.Exception.Response).StatusCode
+        if ($_.Exception -is [Microsoft.PowerShell.Commands.HttpResponseException]) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
         } elseif ($msg -match '\((\d{3})\)') {
             $statusCode = [int]$Matches[1]
         }
         [PSCustomObject]@{ Ok = $false; StatusCode = $statusCode; Message = $msg }
     }
-}
+} -ThrottleLimit $stressParallel
 
-$pool = [RunspaceFactory]::CreateRunspacePool(1, $stressParallel)
-$pool.Open()
-$jobs = [System.Collections.ArrayList]::new()
-for ($i = 1; $i -le $stressRequests; $i++) {
-    $ps = [PowerShell]::Create()
-    $ps.RunspacePool = $pool
-    [void]$ps.AddScript($stressScript).AddArgument($env:MACMON_BASE).AddArgument($authHeaders).AddArgument($stressTimeoutSeconds)
-    $handle = $ps.BeginInvoke()
-    [void]$jobs.Add([PSCustomObject]@{ PowerShell = $ps; Handle = $handle })
-}
-
-$okCount = 0
-$failCount = 0
-foreach ($j in $jobs) {
-    $res = $j.PowerShell.EndInvoke($j.Handle)
-    if ($res.Ok) {
-        $okCount++
-    } else {
-        $failCount++
-    }
-    $j.PowerShell.Dispose()
-}
-$pool.Close()
-$pool.Dispose()
+$okCount   = ($stressResults | Where-Object { $_.Ok }).Count
+$failCount = ($stressResults | Where-Object { -not $_.Ok }).Count
 
 $failPct = if ($stressRequests -eq 0) { 0 } else { [math]::Round(($failCount / [double]$stressRequests) * 100, 1) }
 if ($failPct -ge $stressFailThresholdPct) {
