@@ -56,6 +56,11 @@ $authHeaders = @{ Authorization = "Basic $b64"; Accept = 'application/json' }
 # Timeout aus der Konfiguration lesen, Standardwert 20 Sekunden
 $httpTimeoutSeconds = if ($env:MACMON_TIMEOUT_SECONDS -and $env:MACMON_TIMEOUT_SECONDS -match '^\d+$') { [int]$env:MACMON_TIMEOUT_SECONDS } else { 20 }
 
+# Zertifikatspruefung: standardmaessig AKTIVIERT (sicherer).
+# Nur mit MACMON_SKIP_CERT_CHECK=true wird -SkipCertificateCheck gesetzt.
+$skipCert = ($env:MACMON_SKIP_CERT_CHECK -eq 'true')
+if ($skipCert) { info "Zertifikatspruefung deaktiviert (MACMON_SKIP_CERT_CHECK=true)." }
+
 # ── Hilfsfunktion: HTTP-Request an macmon senden ──────────────────────────────
 # Kapselt GET und POST Requests. Gibt immer ein Objekt mit StatusCode und Body zurück,
 # auch wenn ein Fehler aufgetreten ist (kein unkontrollierter Absturz).
@@ -67,12 +72,11 @@ function Invoke-MacmonRequest {
     )
 
     try {
-        if ($Method -eq 'POST') {
-            $resp = Invoke-WebRequest -UseBasicParsing -SkipCertificateCheck -Method Post -Uri $Uri -Headers $authHeaders -Body $Body -ContentType 'application/json; charset=utf-8' -TimeoutSec $httpTimeoutSeconds -ErrorAction Stop
-        } else {
-            $resp = Invoke-WebRequest -UseBasicParsing -SkipCertificateCheck -Method Get -Uri $Uri -Headers $authHeaders -TimeoutSec $httpTimeoutSeconds -ErrorAction Stop
-        }
-        return [PSCustomObject]@{ StatusCode = [int]$resp.StatusCode; Body = [string]$resp.Content }
+        $webParams = @{ UseBasicParsing = $true; Method = $Method; Uri = $Uri; Headers = $authHeaders; TimeoutSec = $httpTimeoutSeconds; ErrorAction = 'Stop' }
+        if ($Method -eq 'POST') { $webParams.Body = $Body; $webParams.ContentType = 'application/json; charset=utf-8' }
+        if ($skipCert) { $webParams.SkipCertificateCheck = $true }
+        $resp = Invoke-WebRequest @webParams
+        return [PSCustomObject]@{ StatusCode = [int]$resp.StatusCode; Body = [string]$resp.Content; TransportCategory = '' }
     } catch {
         $statusCode = 0
         $content = ''
@@ -90,7 +94,43 @@ function Invoke-MacmonRequest {
         # macmon gibt bei "nicht gefunden" manchmal einen speziellen Fehlercode zurück
         if ($statusCode -eq 0 -and $content -match '"code"\s*:\s*1010|not found') { $statusCode = 404 }
 
-        return [PSCustomObject]@{ StatusCode = $statusCode; Body = $content }
+        # Transport-Fehler genauer klassifizieren (DNS, TLS, Timeout, Refused, Network)
+        $transportCategory = ''
+        if ($statusCode -eq 0) {
+            $ex = $_.Exception
+            $inner = $ex.InnerException
+            $socketEx = if ($inner -is [System.Net.Sockets.SocketException]) { $inner }
+                        elseif ($inner -and $inner.InnerException -is [System.Net.Sockets.SocketException]) { $inner.InnerException }
+                        else { $null }
+
+            if ($ex -is [System.Threading.Tasks.TaskCanceledException] -or
+                $ex -is [System.OperationCanceledException] -or
+                $content -match 'Timeout|timed out|TaskCanceledException') {
+                $transportCategory = 'Timeout'
+            }
+            elseif ($socketEx -and $socketEx.SocketErrorCode -in @('HostNotFound','NoData')) {
+                $transportCategory = 'DNS'
+            }
+            elseif ($content -match 'No such host|Name or service not known|resolve|DNS|getaddrinfo') {
+                $transportCategory = 'DNS'
+            }
+            elseif ($socketEx -and $socketEx.SocketErrorCode -eq 'ConnectionRefused') {
+                $transportCategory = 'Refused'
+            }
+            elseif ($content -match 'Connection refused|actively refused|No connection could be made') {
+                $transportCategory = 'Refused'
+            }
+            elseif ($inner -is [System.Security.Authentication.AuthenticationException] -or
+                    ($inner -and $inner.InnerException -is [System.Security.Authentication.AuthenticationException]) -or
+                    $content -match 'SSL|TLS|certificate|secure channel|trust relationship') {
+                $transportCategory = 'TLS'
+            }
+            else {
+                $transportCategory = 'Network'
+            }
+        }
+
+        return [PSCustomObject]@{ StatusCode = $statusCode; Body = $content; TransportCategory = $transportCategory }
     }
 }
 
@@ -168,7 +208,8 @@ if ($performLoginCheck) {
     $login = Invoke-MacmonRequest -Method GET -Uri $env:MACMON_BASE
     if ($login.StatusCode -in 401, 403) { fail "Authentifizierung bei macmon fehlgeschlagen (HTTP $($login.StatusCode))." }
     if ($login.StatusCode -eq 0 -or $login.StatusCode -ge 500) {
-        fail "MacMon API derzeit nicht gesund (HTTP $($login.StatusCode)). Lauf wird vor Parallelphase abgebrochen. Details: $($login.Body)"
+        $categoryHint = if ($login.TransportCategory) { " [$($login.TransportCategory)]" } else { '' }
+        fail "MacMon API derzeit nicht gesund (HTTP $($login.StatusCode))$categoryHint. Lauf wird vor Parallelphase abgebrochen. Details: $($login.Body)"
     }
     if ($login.StatusCode -in 200, 404) { info "API-Login erfolgreich." } else { info "API-Antwort auf Login-Check: HTTP $($login.StatusCode)" }
 } else {
@@ -193,9 +234,11 @@ $checkResults = $macList | ForEach-Object -Parallel {
     $uri   = "$using:macmonBase/$($entry.Mac)"  # z.B. https://macmon/api/v1.1/endpoints/AA-BB-CC-DD-EE-FF
 
     try {
-        $resp = Invoke-WebRequest -UseBasicParsing -SkipCertificateCheck -Method Get -Uri $uri -Headers $using:authHeaders -TimeoutSec $using:timeoutSeconds -ErrorAction Stop
+        $webParams = @{ UseBasicParsing = $true; Method = 'Get'; Uri = $uri; Headers = $using:authHeaders; TimeoutSec = $using:timeoutSeconds; ErrorAction = 'Stop' }
+        if ($using:skipCert) { $webParams.SkipCertificateCheck = $true }
+        $resp = Invoke-WebRequest @webParams
         # HTTP 200 → MAC existiert bereits
-        [PSCustomObject]@{ MacEntry = $entry; StatusCode = [int]$resp.StatusCode; Body = $resp.Content; Action = 'exists' }
+        [PSCustomObject]@{ MacEntry = $entry; StatusCode = [int]$resp.StatusCode; Body = $resp.Content; Action = 'exists'; TransportCategory = '' }
     } catch {
         $statusCode = 0
         $content    = ''
@@ -211,16 +254,56 @@ $checkResults = $macList | ForEach-Object -Parallel {
 
         if ($statusCode -eq 0 -and $content -match '"code"\s*:\s*1010|not found') { $statusCode = 404 }
 
+        # Transport-Fehler genauer klassifizieren
+        $transportCategory = ''
+        if ($statusCode -eq 0) {
+            $ex = $_.Exception
+            $inner = $ex.InnerException
+            $socketEx = if ($inner -is [System.Net.Sockets.SocketException]) { $inner }
+                        elseif ($inner -and $inner.InnerException -is [System.Net.Sockets.SocketException]) { $inner.InnerException }
+                        else { $null }
+
+            if ($ex -is [System.Threading.Tasks.TaskCanceledException] -or
+                $ex -is [System.OperationCanceledException] -or
+                $content -match 'Timeout|timed out|TaskCanceledException') {
+                $transportCategory = 'Timeout'
+            }
+            elseif ($socketEx -and $socketEx.SocketErrorCode -in @('HostNotFound','NoData')) {
+                $transportCategory = 'DNS'
+            }
+            elseif ($content -match 'No such host|Name or service not known|resolve|DNS|getaddrinfo') {
+                $transportCategory = 'DNS'
+            }
+            elseif ($socketEx -and $socketEx.SocketErrorCode -eq 'ConnectionRefused') {
+                $transportCategory = 'Refused'
+            }
+            elseif ($content -match 'Connection refused|actively refused|No connection could be made') {
+                $transportCategory = 'Refused'
+            }
+            elseif ($inner -is [System.Security.Authentication.AuthenticationException] -or
+                    ($inner -and $inner.InnerException -is [System.Security.Authentication.AuthenticationException]) -or
+                    $content -match 'SSL|TLS|certificate|secure channel|trust relationship') {
+                $transportCategory = 'TLS'
+            }
+            else {
+                $transportCategory = 'Network'
+            }
+        }
+
         # HTTP 404 → MAC unbekannt → muss angelegt werden. Alles andere → Fehler.
         $action = if ($statusCode -eq 404) { 'create' } else { 'error' }
-        [PSCustomObject]@{ MacEntry = $entry; StatusCode = $statusCode; Body = $content; Action = $action }
+        [PSCustomObject]@{ MacEntry = $entry; StatusCode = $statusCode; Body = $content; Action = $action; TransportCategory = $transportCategory }
     }
 } -ThrottleLimit $parallelLimit
 
 # ── Ergebnisse der Prüfung auswerten ─────────────────────────────────────────
 $existsCount       = 0
 $errorCount        = 0
-$transportErrorCount = 0
+$dnsErrorCount     = 0
+$tlsErrorCount     = 0
+$timeoutErrorCount = 0
+$refusedErrorCount = 0
+$networkErrorCount = 0
 $authErrorCount    = 0
 $serverErrorCount  = 0
 $otherErrorCount   = 0
@@ -241,11 +324,20 @@ foreach ($r in $checkResults) {
         'error' {
             # Fehler kategorisieren für die spätere Zusammenfassung
             $errorCount++
-            if ($r.StatusCode -eq 0) { $transportErrorCount++ }        # kein HTTP = Netzwerkfehler
+            if ($r.StatusCode -eq 0) {
+                switch ($r.TransportCategory) {
+                    'DNS'     { $dnsErrorCount++ }
+                    'TLS'     { $tlsErrorCount++ }
+                    'Timeout' { $timeoutErrorCount++ }
+                    'Refused' { $refusedErrorCount++ }
+                    default   { $networkErrorCount++ }
+                }
+            }
             elseif ($r.StatusCode -in 401, 403) { $authErrorCount++ }  # falsches Passwort o.ä.
             elseif ($r.StatusCode -ge 500) { $serverErrorCount++ }      # macmon-Server hat ein Problem
             else { $otherErrorCount++ }
-            err "[$($entry.MacType)] Fehler beim Pruefen $($entry.Mac) (HTTP $($r.StatusCode))"
+            $errorLabel = if ($r.StatusCode -eq 0 -and $r.TransportCategory) { $r.TransportCategory } else { "HTTP $($r.StatusCode)" }
+            err "[$($entry.MacType)] Fehler beim Pruefen $($entry.Mac) ($errorLabel)"
             if ($r.Body) { err "  Details: $($r.Body)" }
         }
     }
@@ -268,8 +360,10 @@ if ($toCreate.Count -gt 0) {
 
         try {
             # POST an die macmon-API → neuen Endpunkt anlegen
-            $resp = Invoke-WebRequest -UseBasicParsing -SkipCertificateCheck -Method Post -Uri $using:macmonBase -Headers $using:authHeaders -Body $payload -ContentType 'application/json; charset=utf-8' -TimeoutSec $using:timeoutSeconds -ErrorAction Stop
-            [PSCustomObject]@{ MacEntry = $entry; StatusCode = [int]$resp.StatusCode; Body = $resp.Content; Success = $true }
+            $webParams = @{ UseBasicParsing = $true; Method = 'Post'; Uri = $using:macmonBase; Headers = $using:authHeaders; Body = $payload; ContentType = 'application/json; charset=utf-8'; TimeoutSec = $using:timeoutSeconds; ErrorAction = 'Stop' }
+            if ($using:skipCert) { $webParams.SkipCertificateCheck = $true }
+            $resp = Invoke-WebRequest @webParams
+            [PSCustomObject]@{ MacEntry = $entry; StatusCode = [int]$resp.StatusCode; Body = $resp.Content; Success = $true; TransportCategory = '' }
         } catch {
             $statusCode = 0
             $content    = ''
@@ -283,7 +377,43 @@ if ($toCreate.Count -gt 0) {
                 elseif ($content -match '\b([1-5]\d{2})\b') { $statusCode = [int]$Matches[1] }
             }
 
-            [PSCustomObject]@{ MacEntry = $entry; StatusCode = $statusCode; Body = $content; Success = $false }
+            # Transport-Fehler genauer klassifizieren
+            $transportCategory = ''
+            if ($statusCode -eq 0) {
+                $ex = $_.Exception
+                $inner = $ex.InnerException
+                $socketEx = if ($inner -is [System.Net.Sockets.SocketException]) { $inner }
+                            elseif ($inner -and $inner.InnerException -is [System.Net.Sockets.SocketException]) { $inner.InnerException }
+                            else { $null }
+
+                if ($ex -is [System.Threading.Tasks.TaskCanceledException] -or
+                    $ex -is [System.OperationCanceledException] -or
+                    $content -match 'Timeout|timed out|TaskCanceledException') {
+                    $transportCategory = 'Timeout'
+                }
+                elseif ($socketEx -and $socketEx.SocketErrorCode -in @('HostNotFound','NoData')) {
+                    $transportCategory = 'DNS'
+                }
+                elseif ($content -match 'No such host|Name or service not known|resolve|DNS|getaddrinfo') {
+                    $transportCategory = 'DNS'
+                }
+                elseif ($socketEx -and $socketEx.SocketErrorCode -eq 'ConnectionRefused') {
+                    $transportCategory = 'Refused'
+                }
+                elseif ($content -match 'Connection refused|actively refused|No connection could be made') {
+                    $transportCategory = 'Refused'
+                }
+                elseif ($inner -is [System.Security.Authentication.AuthenticationException] -or
+                        ($inner -and $inner.InnerException -is [System.Security.Authentication.AuthenticationException]) -or
+                        $content -match 'SSL|TLS|certificate|secure channel|trust relationship') {
+                    $transportCategory = 'TLS'
+                }
+                else {
+                    $transportCategory = 'Network'
+                }
+            }
+
+            [PSCustomObject]@{ MacEntry = $entry; StatusCode = $statusCode; Body = $content; Success = $false; TransportCategory = $transportCategory }
         }
     } -ThrottleLimit $parallelLimit
 
@@ -299,11 +429,20 @@ if ($toCreate.Count -gt 0) {
             warn "[$($entry.MacType)] Bereits vorhanden (409 Conflict): $($entry.Mac)"
         } else {
             $errorCount++
-            if ($result.StatusCode -eq 0) { $transportErrorCount++ }
+            if ($result.StatusCode -eq 0) {
+                switch ($result.TransportCategory) {
+                    'DNS'     { $dnsErrorCount++ }
+                    'TLS'     { $tlsErrorCount++ }
+                    'Timeout' { $timeoutErrorCount++ }
+                    'Refused' { $refusedErrorCount++ }
+                    default   { $networkErrorCount++ }
+                }
+            }
             elseif ($result.StatusCode -in 401, 403) { $authErrorCount++ }
             elseif ($result.StatusCode -ge 500) { $serverErrorCount++ }
             else { $otherErrorCount++ }
-            err "[$($entry.MacType)] Fehler beim Anlegen $($entry.Mac) (HTTP $($result.StatusCode))"
+            $errorLabel = if ($result.StatusCode -eq 0 -and $result.TransportCategory) { $result.TransportCategory } else { "HTTP $($result.StatusCode)" }
+            err "[$($entry.MacType)] Fehler beim Anlegen $($entry.Mac) ($errorLabel)"
             if ($result.Body) { err "  Details: $($result.Body)" }
         }
     }
@@ -313,7 +452,12 @@ if ($toCreate.Count -gt 0) {
 $checkedCount = $totalMacs
 info "Import beendet. Geraete=$deviceCount, Geprueft=$checkedCount, Uebersprungen=$skippedCount, Vorhanden=$existsCount, Neu=$createdCount, Fehler=$errorCount"
 if ($errorCount -gt 0) {
-    info "Fehlerzusammenfassung: Transport(HTTP0)=$transportErrorCount, Auth(401/403)=$authErrorCount, Server(5xx)=$serverErrorCount, Sonstige=$otherErrorCount"
+    $transportTotal = $dnsErrorCount + $tlsErrorCount + $timeoutErrorCount + $refusedErrorCount + $networkErrorCount
+    $transportSummary = "Transport=$transportTotal"
+    if ($transportTotal -gt 0) {
+        $transportSummary += " (DNS=$dnsErrorCount, TLS=$tlsErrorCount, Timeout=$timeoutErrorCount, Refused=$refusedErrorCount, Network=$networkErrorCount)"
+    }
+    info "Fehlerzusammenfassung: $transportSummary, Auth(401/403)=$authErrorCount, Server(5xx)=$serverErrorCount, Sonstige=$otherErrorCount"
 }
 
 if ($createdCount -eq 0) {
