@@ -53,6 +53,3 @@ try {
 }
 
 
-# Todo: Ich Gruppe wieso manchmal Default ist manchmal nicht
-# Todo1: Was passiert mit doppelten mac adressen
-# Todo2: Anletung umschreiben 
